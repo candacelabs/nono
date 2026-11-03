@@ -1,3 +1,53 @@
+> **Candace Labs' fork of [nolabs-ai/nono](https://github.com/nolabs-ai/nono)**, kept in sync with upstream `main`. [csf](https://github.com/candacelabs) sandboxes every agent it runs with nono, from Go, through [candacelabs/nono-go](https://github.com/candacelabs/nono-go). These are the two changes that needs; both are opt-in, and upstream behavior is unchanged without them. Upstream's README follows below.
+>
+> ## Why we forked
+>
+> | | nolabs-ai/nono | this fork |
+> |---|---|---|
+> | limit what a sandboxed process may **execute**, from C | no: read access implies execute | `nono_sandbox_restrict_execute` |
+> | a sandbox-only build | always 235 crates, with a TLS stack (`reqwest`, `aws-lc-sys`) | `default-features = false`: 99 crates, no C dependencies |
+>
+> ## What's different
+>
+> ### `nono_sandbox_restrict_execute`: reading a file no longer means running it
+>
+> Upstream, a path the sandbox may read is a path it may execute:
+>
+> ```c
+> nono_sandbox_apply(caps);                       // caps: read "/"
+> execl("/usr/bin/curl", "curl", url, NULL);      // runs
+> ```
+>
+> This fork stacks a second Landlock layer that handles only the execute right:
+>
+> ```c
+> nono_sandbox_apply(caps);                       // caps: read "/"
+> const char *run[] = { "/usr/bin/git" };
+> nono_sandbox_restrict_execute(run, 1);
+> execl("/usr/bin/curl", "curl", url, NULL);      // EACCES
+> execl("/usr/bin/git", "git", "--version", NULL); // runs
+> ```
+>
+> Linux only; elsewhere it returns `ErrUnsupportedPlatform`. Not proposed upstream yet.
+>
+> ### Sigstore is optional
+>
+> ```toml
+> # upstream: the sandbox always brings Sigstore, reqwest and aws-lc-sys
+> nono = { git = "https://github.com/nolabs-ai/nono" }
+>
+> # this fork: the sandbox alone (nono-cli opts back in; attestation stays behind the feature)
+> nono = { git = "https://github.com/candacelabs/nono", default-features = false }
+> ```
+>
+> For nono-go's `linux/amd64` library this is 21 MB → 3.3 MB, and it no longer needs glibc 2.38. Proposed upstream as [nolabs-ai/nono#2030](https://github.com/nolabs-ai/nono/pull/2030) (open).
+>
+> ## Staying current
+>
+> Upstream `main` is merged in (never rebased), so this fork's history only grows. Synced with nolabs-ai/nono `9297e2c` on 2026-11-03.
+
+---
+
 <div align="center">
 
 <img src="assets/logo.gif" alt="nono logo" width="600"/>
