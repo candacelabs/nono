@@ -2,7 +2,9 @@
 
 use crate::capability_set::NonoCapabilitySet;
 use crate::types::{NonoErrorCode, NonoSupportInfo};
-use crate::{map_error, rust_string_to_c, set_last_error};
+use crate::{c_str_to_str, map_error, rust_string_to_c, set_last_error};
+use std::ffi::c_char;
+use std::path::PathBuf;
 
 /// Apply the sandbox with the given capabilities.
 ///
@@ -87,4 +89,60 @@ mod tests {
             assert_eq!(rc, NonoErrorCode::ErrInvalidArg);
         }
     }
+}
+
+/// Restrict which files the current process and all its children may
+/// execute to `paths`.
+///
+/// This stacks a second Landlock layer that handles only the execute right:
+/// a file outside `paths` can no longer be executed, even where
+/// `nono_sandbox_apply()` granted read access (which includes execute). Read
+/// and write grants are unaffected. Like `nono_sandbox_apply()`, it is
+/// **irreversible**. Call it after `nono_sandbox_apply()`.
+///
+/// Requires Linux with Landlock ABI v3 or later; elsewhere it returns
+/// `ErrUnsupportedPlatform`. With `count` 0, nothing may be executed.
+///
+/// Returns `Ok` on success.
+///
+/// # Safety
+///
+/// When `count` is non-zero, `paths` must point to `count` valid
+/// NUL-terminated UTF-8 strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nono_sandbox_restrict_execute(
+    paths: *const *const c_char,
+    count: usize,
+) -> NonoErrorCode {
+    if paths.is_null() && count > 0 {
+        set_last_error("paths pointer is NULL");
+        return NonoErrorCode::ErrInvalidArg;
+    }
+    let mut owned: Vec<PathBuf> = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: the caller guarantees `count` valid pointers.
+        let ptr = unsafe { *paths.add(index) };
+        match unsafe { c_str_to_str(ptr) } {
+            Some(path) => owned.push(PathBuf::from(path)),
+            None => {
+                set_last_error(&format!("path {index} is NULL or not valid UTF-8"));
+                return NonoErrorCode::ErrInvalidArg;
+            }
+        }
+    }
+    restrict_execute_paths(&owned)
+}
+
+#[cfg(target_os = "linux")]
+fn restrict_execute_paths(paths: &[PathBuf]) -> NonoErrorCode {
+    match nono::Sandbox::restrict_execute(paths) {
+        Ok(()) => NonoErrorCode::Ok,
+        Err(e) => map_error(&e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restrict_execute_paths(_paths: &[PathBuf]) -> NonoErrorCode {
+    set_last_error("execute restriction requires Linux with Landlock ABI v3 or later");
+    NonoErrorCode::ErrUnsupportedPlatform
 }

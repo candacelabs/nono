@@ -717,6 +717,28 @@ bool nono_sandbox_is_supported(void);
 struct NonoSupportInfo nono_sandbox_support_info(void);
 
 /**
+ * Restrict which files the current process and all its children may
+ * execute to `paths`.
+ *
+ * This stacks a second Landlock layer that handles only the execute right:
+ * a file outside `paths` can no longer be executed, even where
+ * `nono_sandbox_apply()` granted read access (which includes execute). Read
+ * and write grants are unaffected. Like `nono_sandbox_apply()`, it is
+ * **irreversible**. Call it after `nono_sandbox_apply()`.
+ *
+ * Requires Linux with Landlock ABI v3 or later; elsewhere it returns
+ * `ErrUnsupportedPlatform`. With `count` 0, nothing may be executed.
+ *
+ * Returns `Ok` on success.
+ *
+ * # Safety
+ *
+ * When `count` is non-zero, `paths` must point to `count` valid
+ * NUL-terminated UTF-8 strings.
+ */
+enum NonoErrorCode nono_sandbox_restrict_execute(const char *const *paths, uintptr_t count);
+
+/**
  * Create a state snapshot from a capability set.
  *
  * Returns NULL if `caps` is NULL.
