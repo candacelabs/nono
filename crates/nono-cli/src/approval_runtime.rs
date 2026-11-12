@@ -956,10 +956,12 @@ mod tests {
         ApprovalRequest::Endpoint {
             request_id: "req-1".to_string(),
             route_id: "internal-api".to_string(),
+            credential_route: None,
             upstream: "https://api.internal.example".to_string(),
             method: "POST".to_string(),
             path: "/v1/tasks/1/comments".to_string(),
             rule_label: "endpoint_policy.approve[POST /v1/tasks/*/comments]".to_string(),
+            operation: None,
             reason: None,
             child_pid: 0,
             session_id: "proxy".to_string(),

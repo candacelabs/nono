@@ -289,11 +289,19 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         false,
     );
 
+    let workdir = resolve_requested_workdir(args.sandbox.workdir.as_ref());
+    let session_recording = crate::terminal_capture::settings::resolve(
+        prepared.session_recording.as_ref(),
+        &args.recording,
+        &crate::launch_runtime::launch_dir()?,
+        &workdir,
+    )?;
     let flags = ExecutionFlags {
         strategy,
-        workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
+        workdir,
         no_diagnostics: true,
         startup_timeout_secs: args.startup_timeout_secs,
+        session_recording,
         network,
         session: SessionLaunchOptions {
             session_id: Some(session_id),
@@ -459,6 +467,10 @@ mod tests {
 
     #[test]
     fn shell_dry_run_rejects_block_net_with_upstream_proxy() {
+        // Sandbox preparation reads HOME and profile dirs that other tests swap.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let args = ShellArgs {
             sandbox: SandboxArgs {
                 dry_run: true,
@@ -470,6 +482,7 @@ mod tests {
             shell: Some(PathBuf::from("/bin/sh")),
             name: None,
             startup_timeout_secs: None,
+            recording: Default::default(),
             help: None,
         };
 

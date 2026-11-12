@@ -340,23 +340,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .unwrap_or_default();
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
-        .filter_map(|e| match e {
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
-                Some(sandbox_state::DomainEndpointState {
-                    domain: domain.clone(),
-                    endpoints: endpoints
-                        .iter()
-                        .map(|r| sandbox_state::EndpointRuleState {
-                            method: r.method.clone(),
-                            path: r.path.clone(),
-                        })
-                        .collect(),
-                })
-            }
-            _ => None,
-        })
+        .filter_map(|e| sandbox_state::DomainEndpointState::from_allow_domain(e))
         .collect();
     let cap_file = write_capability_state_file(
         &caps,
@@ -410,11 +394,22 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             ),
     );
 
+    // One registry per session collects every credential value nono resolves
+    // so the supervisor can redact it from terminal recordings (NEP-0010
+    // §3.1). Environment credentials are registered before any proxy starts;
+    // the proxies register route, refreshed, and captured values as they
+    // obtain them.
+    let secret_registry = nono_proxy::SecretRegistry::new();
+    for secret in &loaded_secrets {
+        secret_registry.register(&secret.env_var, secret.value.as_str());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let shared_broker = crate::tool_sandbox::token_broker::new_shared_broker();
     let active_proxy = start_proxy_runtime(
         network,
         &mut caps,
+        &secret_registry,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Some(shared_broker.clone()),
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -807,6 +802,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
     match strategy {
         exec_strategy::ExecStrategy::Direct => {
+            // Direct execution has no supervisor to record the terminal.
+            crate::terminal_capture::check_unsupervised(flags.session_recording.as_ref())?;
             exec_strategy::execute_direct(&config)?;
             unreachable!("execute_direct only returns on error");
         }
@@ -846,6 +843,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 #[cfg(target_os = "linux")]
                 network_denial_audit: flags.network_denial_audit,
                 silent: flags.silent,
+                secret_registry,
+                session_recording: flags.session_recording.clone(),
             });
 
             // Runtime dir cleanup must run on both Ok and Err paths because

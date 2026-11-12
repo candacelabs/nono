@@ -1092,7 +1092,14 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 .iter()
                 .map(|e| match e {
                     profile::AllowDomainEntry::Plain(s) => s.clone(),
-                    profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                    profile::AllowDomainEntry::WithEndpoints {
+                        domain,
+                        endpoint_policy: Some(_),
+                        ..
+                    } => format!("{} (endpoint policy)", domain),
+                    profile::AllowDomainEntry::WithEndpoints {
+                        domain, endpoints, ..
+                    } => {
                         format!("{} ({} endpoint rules)", domain, endpoints.len())
                     }
                 })
@@ -1217,6 +1224,34 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 theme::fg(g, t.text)
             );
         }
+    }
+
+    // Session recording
+    if let Some(recording) = profile
+        .session_recording
+        .as_ref()
+        .filter(|recording| recording.is_enabled())
+    {
+        let mut parts = vec![if recording.required == Some(true) {
+            "required".to_string()
+        } else {
+            "on".to_string()
+        }];
+        if recording.input == Some(crate::profile::SessionRecordingInput::Off) {
+            parts.push("input off".to_string());
+        }
+        if let Some(max_bytes) = recording.max_bytes {
+            parts.push(format!("max {max_bytes} bytes"));
+        }
+        if let Some(file) = recording.file.as_deref() {
+            parts.push(format!("file {file}"));
+        }
+        println!();
+        println!(
+            "  {}  {}",
+            theme::fg("Session recording:", t.subtext).bold(),
+            theme::fg(&parts.join(", "), t.text)
+        );
     }
 
     // Open URLs
@@ -1381,6 +1416,10 @@ fn profile_to_json(
         "exclude_patterns": profile.rollback.exclude_patterns,
         "exclude_globs": profile.rollback.exclude_globs,
     });
+
+    if let Some(recording) = profile.session_recording.as_ref() {
+        val["session_recording"] = serde_json::json!(recording);
+    }
 
     // Env credentials
     if !profile.env_credentials.mappings.is_empty() {
@@ -2009,6 +2048,18 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
                     new.env_var
                 );
             }
+            if old.phantom_format != new.phantom_format {
+                println!(
+                    "      {} phantom_format: {:?}",
+                    theme::fg("-", t.red),
+                    old.phantom_format
+                );
+                println!(
+                    "      {} phantom_format: {:?}",
+                    theme::fg("+", t.green),
+                    new.phantom_format
+                );
+            }
         }
     }
 
@@ -2350,6 +2401,12 @@ fn diff_custom_credentials_json(
             detail.insert(
                 "env_var".into(),
                 serde_json::json!({"profile1": old.env_var, "profile2": new.env_var}),
+            );
+        }
+        if old.phantom_format != new.phantom_format {
+            detail.insert(
+                "phantom_format".into(),
+                serde_json::json!({"profile1": old.phantom_format, "profile2": new.phantom_format}),
             );
         }
         changed_details.insert((*k).clone(), serde_json::Value::Object(detail));
@@ -3137,14 +3194,32 @@ fn resolve_to_manifest(
         manifest::NetworkMode::Unrestricted
     };
 
+    // Manifest export of network endpoints is left as is here; it already has
+    // known gaps. The manifest has no deny or approve rules, so entries with
+    // endpoint_policy are rejected rather than exported partially.
+    if let Some(entry) = prof.network.allow_domain.iter().find(|e| {
+        matches!(
+            e,
+            profile::AllowDomainEntry::WithEndpoints {
+                endpoint_policy: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Err(NonoError::ProfileParse(format!(
+            "allow_domain entry '{}' uses endpoint_policy, which a capability manifest cannot represent",
+            entry.domain()
+        )));
+    }
+
     let manifest_endpoints: Vec<manifest::NetworkEndpoint> = prof
         .network
         .allow_domain
         .iter()
         .filter_map(|e| match e {
-            profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
-                if !endpoints.is_empty() =>
-            {
+            profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } if !endpoints.is_empty() => {
                 let host: manifest::NetworkEndpointHost = domain.as_str().try_into().ok()?;
                 let rules = endpoints
                     .iter()
@@ -3292,6 +3367,12 @@ fn resolve_to_manifest(
             })
             .collect::<Result<Vec<_>>>()?;
 
+        if cred.phantom_format.is_some() {
+            eprintln!(
+                "warning: custom credential '{name}': `phantom_format` is not representable in the capability manifest and was omitted"
+            );
+        }
+
         credentials.push(manifest::Credential {
             name: name
                 .parse()
@@ -3386,6 +3467,26 @@ fn make_fs_grant(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_diff_custom_credentials_json_reports_phantom_format() {
+        let base: profile::CustomCredentialDef = serde_json::from_str(
+            r#"{"upstream":"https://api.github.com","credential_key":"k","env_var":"GH_TOKEN"}"#,
+        )
+        .unwrap();
+        let formatted = profile::CustomCredentialDef {
+            phantom_format: Some("ghp_{}".to_string()),
+            ..base.clone()
+        };
+        let old = std::collections::HashMap::from([("github".to_string(), base)]);
+        let new = std::collections::HashMap::from([("github".to_string(), formatted)]);
+        let diff = diff_custom_credentials_json(&old, &new);
+        assert_eq!(
+            diff["changed"]["github"]["phantom_format"],
+            serde_json::json!({"profile1": null, "profile2": "ghp_{}"})
+        );
+    }
     use super::*;
     use crate::profile::Profile;
     use std::path::PathBuf;

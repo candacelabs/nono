@@ -152,6 +152,9 @@ struct ProxyCredentialCaptureBackend {
     /// directories from PATH before the credential-capture browser helper
     /// (an unsandboxed host-side process) resolves `open`/`xdg-open`.
     outer_caps: CapabilitySet,
+    /// Session secret registry (NEP-0010 §3.1). Every successfully captured
+    /// value is registered so terminal recordings can redact it.
+    secret_registry: Option<nono_proxy::SecretRegistry>,
 }
 
 struct ActiveCaptureGuard<'a> {
@@ -320,7 +323,13 @@ impl ProxyCredentialCaptureBackend {
             active_cv: Condvar::new(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
             outer_caps,
+            secret_registry: None,
         })
+    }
+
+    fn with_secret_registry(mut self, registry: Option<nono_proxy::SecretRegistry>) -> Self {
+        self.secret_registry = registry;
+        self
     }
 
     fn capture_cache_scope(
@@ -748,6 +757,10 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                 }
                 err
             })?;
+        // Register before the value is cached or returned for injection.
+        if let Some(registry) = &self.secret_registry {
+            register_capture_material(registry, &request.credential_name, &response.material);
+        }
         if !entry.ttl.is_zero() {
             let mut cache = self.cache.lock().map_err(|_| {
                 nono_proxy::capture::CredentialCaptureError::new(
@@ -769,6 +782,30 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
         }
         drop(guard);
         Ok(response)
+    }
+}
+
+/// Register captured credential material under the credential name. Header
+/// values are registered whole and, for `<scheme> <token>` values, as the
+/// bare token too. Names are never secret.
+fn register_capture_material(
+    registry: &nono_proxy::SecretRegistry,
+    credential_name: &str,
+    material: &nono_proxy::capture::CredentialCaptureMaterial,
+) {
+    match material {
+        nono_proxy::capture::CredentialCaptureMaterial::Secret(secret) => {
+            registry.register(credential_name, secret.as_str());
+        }
+        nono_proxy::capture::CredentialCaptureMaterial::Headers(headers) => {
+            for (header_name, value) in headers {
+                let name = format!("{credential_name}:{header_name}");
+                registry.register(&name, value.as_str());
+                if let Some((_, token)) = value.split_once(' ') {
+                    registry.register(&name, token.trim());
+                }
+            }
+        }
     }
 }
 
@@ -1508,7 +1545,7 @@ pub(crate) fn prepare_proxy_launch_options(
 
     let (plain_entries, endpoint_entries): (Vec<_>, Vec<_>) = allow_domain
         .into_iter()
-        .partition(|e| !matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+        .partition(|e| !e.has_endpoint_restrictions());
 
     let domain_filter =
         if network_profile.is_some() || !plain_entries.is_empty() || !deny_domain.is_empty() {
@@ -1525,8 +1562,8 @@ pub(crate) fn prepare_proxy_launch_options(
         debug_assert!(
             endpoint_entries
                 .iter()
-                .all(|e| matches!(e, crate::profile::AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty())),
-            "EndpointFilterIntent invariant violated: all entries must have non-empty endpoints"
+                .all(crate::profile::AllowDomainEntry::has_endpoint_restrictions),
+            "EndpointFilterIntent invariant violated: all entries must restrict endpoints"
         );
         Some(EndpointFilterIntent {
             routes: endpoint_entries,
@@ -1732,8 +1769,15 @@ pub(crate) fn resolve_effective_proxy_settings(
         .network_profile
         .clone()
         .or_else(|| prepared.network_profile.clone());
-    let mut allow_domain = prepared.allow_domain.clone();
-    allow_domain.extend(args.allow_proxy.iter().map(|s| parse_allow_domain_arg(s)));
+    // Merge so a CLI entry for a profile domain adds to its rules instead of
+    // producing a second route that replaces them.
+    let cli_allow_domain: Vec<_> = args
+        .allow_proxy
+        .iter()
+        .map(|s| parse_allow_domain_arg(s))
+        .collect();
+    let allow_domain =
+        crate::profile::merge_allow_domain(&prepared.allow_domain, &cli_allow_domain);
     let mut deny_domain = prepared.deny_domain.clone();
     deny_domain.extend(args.deny_proxy.iter().cloned());
     let mut credentials = prepared.credentials.clone();
@@ -1928,6 +1972,7 @@ fn collect_tool_sandbox_proxy_grants(
             query_param_name: None,
             proxy: None,
             env_var,
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: Some(endpoint_policy),
             tls_ca: credential
@@ -2260,6 +2305,7 @@ fn endpoint_rule_to_proxy(
         backend: rule.backend.clone(),
         reason: rule.reason.clone(),
         timeout_secs: resolve_approval_timeout(config, rule.backend.as_deref(), rule.timeout_secs),
+        operations: rule.operations.clone(),
     }
 }
 
@@ -2305,6 +2351,7 @@ pub(crate) fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomain
                     method: "*".to_string(),
                     path: path.to_string(),
                 }],
+                endpoint_policy: None,
             }
         }
     } else {
@@ -2552,14 +2599,24 @@ pub(crate) fn build_credential_capture_backend(
     session_id: String,
     outer_caps: CapabilitySet,
 ) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
+    build_credential_capture_backend_with_registry(credential_capture, session_id, outer_caps, None)
+}
+
+/// Like [`build_credential_capture_backend`], registering every captured
+/// value in `secret_registry` for terminal-recording redaction.
+fn build_credential_capture_backend_with_registry(
+    credential_capture: &HashMap<String, crate::profile::CredentialCaptureEntry>,
+    session_id: String,
+    outer_caps: CapabilitySet,
+    secret_registry: Option<nono_proxy::SecretRegistry>,
+) -> Result<Option<Arc<dyn nono_proxy::capture::CredentialCaptureBackend>>> {
     if credential_capture.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Arc::new(ProxyCredentialCaptureBackend::new(
-        credential_capture,
-        session_id,
-        outer_caps,
-    )?)))
+    Ok(Some(Arc::new(
+        ProxyCredentialCaptureBackend::new(credential_capture, session_id, outer_caps)?
+            .with_secret_registry(secret_registry),
+    )))
 }
 
 fn synthesize_credential_provider_proxy_config(
@@ -2613,6 +2670,7 @@ fn synthesize_credential_provider_proxy_config(
                 query_param_name: None,
                 proxy: None,
                 env_var: route.env_var.clone(),
+                phantom_format: None,
                 endpoint_rules: if endpoint_policy.is_none() {
                     vec![nono_proxy::config::EndpointRule {
                         method: "*".to_string(),
@@ -2976,9 +3034,15 @@ pub(crate) fn apply_tls_intercept_config(
     Ok(())
 }
 
+/// Start the session proxy (and any command-scoped proxies).
+///
+/// Every credential value the proxies load, refresh, or capture — and every
+/// supervisor-sourced credential in `proxy_source_env_vars` — is registered
+/// in `secret_registry` for terminal-recording redaction (NEP-0010 §3.1).
 pub(crate) fn start_proxy_runtime(
     intent: &NetworkIntent,
     caps: &mut CapabilitySet,
+    secret_registry: &nono_proxy::SecretRegistry,
     #[cfg(any(target_os = "linux", target_os = "macos"))] shared_broker: Option<
         crate::tool_sandbox::token_broker::SharedBroker,
     >,
@@ -3005,10 +3069,18 @@ pub(crate) fn start_proxy_runtime(
         });
     }
 
+    // Supervisor-loaded credential values handed to the proxy through the
+    // environment; register them before any proxy can use them.
+    for (env_var, value) in &proxy.proxy_source_env_vars {
+        secret_registry.register(env_var, value);
+    }
     let _source_env_guard = ScopedEnvVars::set(&proxy.proxy_source_env_vars);
     let mut proxy_config = build_proxy_config_from_flags(proxy)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
     proxy_config.outer_caps = Some(caps.clone());
+    // Cloned into the session and every command-scoped proxy config, so all
+    // listeners share one registry.
+    proxy_config.secret_registry = Some(secret_registry.clone());
 
     apply_tls_intercept_config(&mut proxy_config, proxy)?;
 
@@ -3049,10 +3121,11 @@ pub(crate) fn start_proxy_runtime(
             .as_ref()
             .and_then(|d| d.backend.clone()),
     )?;
-    let credential_capture_backend = build_credential_capture_backend(
+    let credential_capture_backend = build_credential_capture_backend_with_registry(
         &proxy.credential_capture,
         proxy.session_id.clone(),
         caps.clone(),
+        Some(secret_registry.clone()),
     )?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let nonce_resolver: Option<Arc<dyn nono_proxy::NonceResolver>> = shared_broker
@@ -3831,6 +3904,33 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_allow_domain_merges_into_profile_endpoint_policy() {
+        let profile: Vec<crate::profile::AllowDomainEntry> = serde_json::from_str(
+            r#"[{ "domain": "github.com", "endpoint_policy": {
+                "deny": [{ "method": "*", "path": "/*/*/git-receive-pack" }],
+                "approve": [{ "method": "*", "path": "/*/*/**" }]
+            } }]"#,
+        )
+        .expect("profile entries");
+        let cli = vec![parse_allow_domain_arg("https://github.com/acme")];
+        let merged = crate::profile::merge_allow_domain(&profile, &cli);
+
+        let json = crate::config::embedded::embedded_network_policy_json();
+        let policy = crate::network_policy::load_network_policy(json).expect("network policy");
+        let (_, routes) =
+            crate::network_policy::partition_allow_domain(&policy, &merged).expect("partition");
+        assert_eq!(routes.len(), 1, "one route per domain");
+        let route_policy = routes[0].endpoint_policy.as_ref().expect("policy");
+        assert_eq!(
+            route_policy.deny.len(),
+            1,
+            "profile deny rules must survive"
+        );
+        assert_eq!(route_policy.approve.len(), 1);
+        assert_eq!(route_policy.allow.len(), 1);
+    }
+
+    #[test]
     fn test_parse_allow_domain_arg_plain_hostname() {
         let entry = parse_allow_domain_arg("github.com");
         assert_eq!(
@@ -3843,7 +3943,9 @@ mod tests {
     fn test_parse_allow_domain_arg_url_with_path() {
         let entry = parse_allow_domain_arg("https://github.com/atko-cic/**");
         match entry {
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "github.com");
                 assert_eq!(endpoints.len(), 1);
                 assert_eq!(endpoints[0].method, "*");
@@ -3875,7 +3977,9 @@ mod tests {
     fn test_parse_allow_domain_arg_deep_path() {
         let entry = parse_allow_domain_arg("https://github.com/org/repo/tree/**");
         match entry {
-            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain, endpoints, ..
+            } => {
                 assert_eq!(domain, "github.com");
                 assert_eq!(endpoints[0].path, "/org/repo/tree/**");
             }
@@ -4210,13 +4314,15 @@ mod tests {
         let entries: Vec<AllowDomainEntry> = serde_json::from_str(r#"[
             "plain.example.com",
             { "domain": "object.example.com" },
-            { "domain": "filtered.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] }
+            { "domain": "filtered.example.com", "endpoints": [{ "method": "GET", "path": "/v1/**" }] },
+            { "domain": "policy.example.com", "endpoint_policy": { "approve": [{ "method": "*", "path": "/**" }] } }
         ]"#)
         .expect("deserialize allow_domain entries");
 
         let (plain, endpoint): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .partition(|e| !matches!(e, AllowDomainEntry::WithEndpoints { endpoints, .. } if !endpoints.is_empty()));
+            .partition(|e| !e.has_endpoint_restrictions());
+        assert!(endpoint.iter().any(|e| e.domain() == "policy.example.com"));
 
         assert_eq!(
             plain.len(),
@@ -4225,8 +4331,8 @@ mod tests {
         );
         assert_eq!(
             endpoint.len(),
-            1,
-            "only the entry with actual endpoint rules goes to endpoint bucket"
+            2,
+            "only entries with endpoint rules or a policy go to the endpoint bucket"
         );
 
         assert!(
@@ -4266,6 +4372,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4293,6 +4400,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
@@ -4374,6 +4482,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
@@ -4450,6 +4559,7 @@ mod tests {
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            session_recording: None,
             network_profile: None,
             allow_domain: Vec::new(),
             deny_domain: Vec::new(),
@@ -4551,6 +4661,7 @@ mod tests {
                                     backend: None,
                                     reason: None,
                                     timeout_secs: None,
+                                    operations: None,
                                 }],
                                 ..EndpointPolicyConfig::default()
                             }),
@@ -4612,6 +4723,7 @@ mod tests {
                 upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
                 aws_auth: Some(nono_proxy::config::AwsAuthConfig {
                     profile: Some("production".to_string()),
+                    profiles: None,
                     region: Some("us-east-1".to_string()),
                     service: Some("bedrock".to_string()),
                 }),
@@ -4776,6 +4888,7 @@ mod tests {
                 backend: None,
                 reason: Some("destructive endpoint".to_string()),
                 timeout_secs: None,
+                operations: None,
             }],
             approve: vec![EndpointRuleConfig {
                 method: "POST".to_string(),
@@ -4783,6 +4896,7 @@ mod tests {
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             allow: vec![EndpointRuleConfig {
                 method: "GET".to_string(),
@@ -4790,6 +4904,7 @@ mod tests {
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
         };
 
@@ -4805,6 +4920,20 @@ mod tests {
             Some("terminal".to_string())
         );
         assert_eq!(proxy_policy.allow.len(), 1);
+    }
+
+    #[test]
+    fn tool_sandbox_proxy_endpoint_rule_maps_operations() {
+        let rule = EndpointRuleConfig {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+            operations: Some(vec!["Describe*".to_string()]),
+        };
+        let mapped = endpoint_rule_to_proxy(&CommandPoliciesConfig::default(), &rule);
+        assert_eq!(mapped.operations, Some(vec!["Describe*".to_string()]));
     }
 
     #[test]
@@ -4846,6 +4975,7 @@ mod tests {
                                     backend: None,
                                     reason: Some("comment write".to_string()),
                                     timeout_secs: Some(5),
+                                    operations: None,
                                 }],
                                 ..EndpointPolicyConfig::default()
                             }),
@@ -4909,6 +5039,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: Some("GITHUB_TOKEN".to_string()),
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
             tls_ca: None,
@@ -5012,6 +5143,77 @@ mod tests {
         assert_capture_secret(&second, "ghp_test");
         assert_eq!(second.metadata.cache_action, "cache_hit");
         Ok(())
+    }
+
+    #[test]
+    fn proxy_credential_capture_backend_registers_captured_secret() -> Result<()> {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "github".to_string(),
+            test_capture_entry(vec![
+                "/bin/echo".to_string(),
+                "ghp_registry_capture_1234".to_string(),
+            ]),
+        );
+        let registry = nono_proxy::SecretRegistry::new();
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-test".to_string(),
+            nono::CapabilitySet::default(),
+        )?
+        .with_secret_registry(Some(registry.clone()));
+        let request = nono_proxy::capture::CredentialCaptureRequest {
+            credential_name: "github".to_string(),
+            route_id: "github".to_string(),
+            request_host: "api.github.com".to_string(),
+            request_path: "/user".to_string(),
+            request_method: "GET".to_string(),
+            session_id: String::new(),
+            cache_scope: String::new(),
+        };
+        assert!(registry.is_empty());
+        let response = nono_proxy::capture::CredentialCaptureBackend::capture(&backend, request)
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_capture_secret(&response, "ghp_registry_capture_1234");
+        let (_, entries) = registry.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "github");
+        assert_eq!(entries[0].value.as_str(), "ghp_registry_capture_1234");
+        Ok(())
+    }
+
+    #[test]
+    fn register_capture_material_registers_header_values_and_tokens() {
+        let registry = nono_proxy::SecretRegistry::new();
+        register_capture_material(
+            &registry,
+            "corp",
+            &nono_proxy::capture::CredentialCaptureMaterial::Headers(vec![
+                (
+                    "Authorization".to_string(),
+                    Zeroizing::new("Bearer corp-header-token-1".to_string()),
+                ),
+                (
+                    "X-Api-Key".to_string(),
+                    Zeroizing::new("corp-api-key-2".to_string()),
+                ),
+            ]),
+        );
+        let values: Vec<(String, String)> = registry
+            .snapshot()
+            .1
+            .into_iter()
+            .map(|e| (e.name, e.value.to_string()))
+            .collect();
+        assert!(values.contains(&(
+            "corp:Authorization".to_string(),
+            "Bearer corp-header-token-1".to_string()
+        )));
+        assert!(values.contains(&(
+            "corp:Authorization".to_string(),
+            "corp-header-token-1".to_string()
+        )));
+        assert!(values.contains(&("corp:X-Api-Key".to_string(), "corp-api-key-2".to_string())));
     }
 
     #[cfg(target_os = "linux")]
