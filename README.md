@@ -44,7 +44,7 @@
 >
 > ## Staying current
 >
-> Upstream `main` is merged in (never rebased), so this fork's history only grows. Synced with nolabs-ai/nono `9297e2c` on 2026-11-03.
+> Upstream `main` is merged in (never rebased), so this fork's history only grows. Synced with nolabs-ai/nono `f1e0a7a` (v0.82.0) on 2026-11-13.
 
 ---
 
